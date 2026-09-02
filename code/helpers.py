@@ -41,12 +41,22 @@ def dynamic_chunker(iterable: Iterable[Any], chunk_sizes: list[int]) -> Iterable
     for chunk in chunk_sizes:
         yield [next(it) for i in range(chunk)]
 
-def clean_dna(length: int, *seq: str):
+def clean_dna(length: int, *seq: str, flank_left: str = "", flank_right: str = ""):
+    """Generate random dna that avoids `seq` (and its reverse complement), including
+    where it would be formed by combining with the sequence immediately upstream
+    (`flank_left`) or downstream (`flank_right`) of the generated region once assembled.
+
+    Only pass the bases of the flank actually close to the boundary (at most
+    `max(len(s) for s in seq) - 1` of them) - not the whole neighboring sequence.
+    A flank that itself already legitimately contains one of `seq` (e.g. the enzyme
+    site the flank was built around) would otherwise make every candidate look
+    contaminated and loop forever.
+    """
 
     dna = ""
     while len(dna) < length:
         candidate = dna + random.choice(list('ATGC'))
-        if not dna_contains_seq(candidate, *seq, reverse_complement=True):
+        if not dna_contains_seq(flank_left + candidate + flank_right, *seq, reverse_complement=True):
             dna = candidate
         else:
             continue

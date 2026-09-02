@@ -2,6 +2,7 @@
 
 import re
 import os
+import shutil
 from os.path import join, exists
 from typing import Optional, Union
 import random
@@ -370,8 +371,11 @@ def split_fasta_by_gene(input_fasta_file, output_directory="individual_genes"):
         output_directory (str, optional): Directory to save individual FASTA files.
             Defaults to "individual_genes".
     """
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
+    # clear out any stale per-gene fastas left over from a previous run/input file,
+    # otherwise gene_files picks up genes that aren't part of the current input_seqs
+    if os.path.exists(output_directory):
+        shutil.rmtree(output_directory)
+    os.makedirs(output_directory)
 
     try:
         for record in SeqIO.parse(input_fasta_file, "fasta"):
@@ -439,11 +443,23 @@ def _add_primers_to_oligo(oligo_len, fprimer: str, rprimer: str,
     left, right = np.array_split(np.arange(extra_space), [extra_space//2])
 
     if pad_oligo:
+        # trim flanks to just short of the enzyme site length so a stuffer can't be
+        # rejected for "containing" the genuine site that's already sitting right
+        # next to it (see clean_dna docstring), while still catching any *new*
+        # site the stuffer forms by combining with bases across that boundary
+        margin = len(enzyme.seq) - 1
+        rprimer_revc = str(Seq(rprimer).reverse_complement())
+        left_stuffer = clean_dna(left.size, enzyme.seq,
+                                  flank_left=fprimer[-margin:],
+                                  flank_right=oligo[:margin]).lower()
+        right_stuffer = clean_dna(right.size, enzyme.seq,
+                                   flank_left=oligo[-margin:],
+                                   flank_right=rprimer_revc[:margin]).lower()
         return "".join([fprimer,
-                            clean_dna(left.size, enzyme.seq).lower(),
+                            left_stuffer,
                             oligo,
-                            clean_dna(right.size, enzyme.seq).lower(),
-                            str(Seq(rprimer).reverse_complement())])
+                            right_stuffer,
+                            rprimer_revc])
 
     else:
         return "".join([fprimer,

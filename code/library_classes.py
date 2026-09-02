@@ -126,7 +126,20 @@ class Library:
         """
         #pylint:disable=line-too-long
 
-        ngenes_per_pool = (njunctions - len([self.upstream_bbsite, self.downstream_bbsite]) - len(self.other_used_sites)) // (self.estimate_nfrags() - 1)
+        print('self:', self)
+        print('njunctions, ', njunctions)
+        print('upstream bbsite, ', self.upstream_bbsite)
+        print('len upstream, ', len(self.upstream_bbsite))
+        print('downstream bbsite, ', self.downstream_bbsite)
+        print('len downstream, ', len(self.downstream_bbsite))
+        print('other used sites, ', self.other_used_sites)
+        print('estimate_nfrags, ', self.estimate_nfrags())
+        prediv = (njunctions - len([self.upstream_bbsite, self.downstream_bbsite]) - len(self.other_used_sites))
+        print('pre-division', prediv)
+
+        # genes that fit in a single fragment (nfrags == 1) need no internal GG junction,
+        # so treat the per-gene junction cost as at least 1 to avoid dividing by zero
+        ngenes_per_pool = (njunctions - len([self.upstream_bbsite, self.downstream_bbsite]) - len(self.other_used_sites)) // max(self.estimate_nfrags() - 1, 1)
         npools = ceil(len(self.genes) / ngenes_per_pool)
 
         print(f"Maximal possible target number of genes per pool: {ngenes_per_pool} genes assembled in {npools} pools.")
@@ -298,6 +311,13 @@ class Pool:
         #pylint:disable=line-too-long
         random.seed(42)
 
+        if self.nfrags == 1:
+            # genes fit within a single fragment - no internal GG junction needed,
+            # assembly relies only on the shared upstream/downstream backbone sites
+            for g in self.genes:
+                g.assigned_sites = pd.DataFrame(columns=['ggsite', 'pos'])
+            return
+
         candidates = list(chain(*[g.get_start_sites_range(self.nfrags) for g in self.genes]))
         selected_sites = np.array(
             [random.choice(c) for c in candidates]
@@ -341,28 +361,30 @@ class Pool:
             )
         ]
 
-        for _ in tqdm(range(nopt_steps), ncols=100, total=nopt_steps, disable=disable_progress, leave=True):
+        # genes with no internal GG junctions (nfrags == 1) have nothing to shuffle/optimize
+        if self.nfrags > 1:
+            for _ in tqdm(range(nopt_steps), ncols=100, total=nopt_steps, disable=disable_progress, leave=True):
 
-            change_idx: int = random.choice(range(len(self.genes)))
-            unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) if i != change_idx])
-            candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
+                change_idx: int = random.choice(range(len(self.genes)))
+                unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) if i != change_idx])
+                candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
 
-            used_sites = np.hstack([
-                unchanged_pool_sites,
-                candidates.ggsite.to_numpy(),
-                np.array([self.upstream_bbsite, self.downstream_bbsite]),
-                np.array(self.other_used_sites)
-            ])
+                used_sites = np.hstack([
+                    unchanged_pool_sites,
+                    candidates.ggsite.to_numpy(),
+                    np.array([self.upstream_bbsite, self.downstream_bbsite]),
+                    np.array(self.other_used_sites)
+                ])
 
-            candidate_fidelity = predict_fidelity(used_sites, self.ligation_data)
+                candidate_fidelity = predict_fidelity(used_sites, self.ligation_data)
 
-            # we are doing a greedy optimization - if better, accept
-            if candidate_fidelity >= opt_trajectory[-1]:
-                self.genes[change_idx].assigned_sites = candidates  # update sites
-                current_state = [g.assigned_sites for g in self.genes]
-                opt_trajectory.append(candidate_fidelity)
-            else:
-                opt_trajectory.append(opt_trajectory[-1])  # use previous fidelity
+                # we are doing a greedy optimization - if better, accept
+                if candidate_fidelity >= opt_trajectory[-1]:
+                    self.genes[change_idx].assigned_sites = candidates  # update sites
+                    current_state = [g.assigned_sites for g in self.genes]
+                    opt_trajectory.append(candidate_fidelity)
+                else:
+                    opt_trajectory.append(opt_trajectory[-1])  # use previous fidelity
 
         self.optimized_sites = current_state
         self.opt_trajectory = opt_trajectory
@@ -493,6 +515,13 @@ class SAPool:
         #pylint:disable=line-too-long
         random.seed(42)
 
+        if self.nfrags == 1:
+            # genes fit within a single fragment - no internal GG junction needed,
+            # assembly relies only on the shared upstream/downstream backbone sites
+            for g in self.genes:
+                g.assigned_sites = pd.DataFrame(columns=['ggsite', 'pos'])
+            return
+
         candidates = list(chain(*[g.get_start_sites_range(self.nfrags) for g in self.genes]))
         selected_sites = np.array(
             [random.choice(c) for c in candidates]
@@ -537,63 +566,65 @@ class SAPool:
             )
         opt_trajectory = [(start_fidelity, start_fidelity, 0, 0, 0, 0, start_temp)]  # (best, current, candidate fidelity, energy_diff, contender, thing to beat, temp)
 
-        # change log range
-        for temp in tqdm(np.linspace(start_temp, end_temp, nopt_steps), ncols=100, total=nopt_steps, disable=disable_progress, leave=True):
+        # genes with no internal GG junctions (nfrags == 1) have nothing to shuffle/optimize
+        if self.nfrags > 1:
+            # change log range
+            for temp in tqdm(np.linspace(start_temp, end_temp, nopt_steps), ncols=100, total=nopt_steps, disable=disable_progress, leave=True):
 
-            while True:
-                change_idx: int = random.choice(range(len(self.genes)))
-                # pool sites from the genes
-                if len(self.genes) > 1:
-                    unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) if i != change_idx])
-                else:
-                    unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) ])
-                # these are a new set of GG sites from change_idx gene - they have to actually be assigned to the gene
-                candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
-
-                # if shuffle sites fails, pick different gene to optimize
-                if candidates is not None:
-                    break
-
-
-            used_sites = np.hstack([
-                unchanged_pool_sites,
-                candidates.ggsite.to_numpy(),
-                np.array([self.upstream_bbsite, self.downstream_bbsite]),
-                np.array(self.other_used_sites)
-            ])
-
-            candidate_fidelity = predict_fidelity(used_sites.tolist(), self.ligation_data)
-            energy_diff = candidate_fidelity - opt_trajectory[-1][1]
-            thing_to_beat = random.random()
-            contender = np.exp(min([0, energy_diff / temp]))
-
-            if contender > thing_to_beat:
-
-                # if we've gotten too far away from the best, then reset to the best
-                if (opt_trajectory[-1][0] - candidate_fidelity) > 0.01:
-                    current_state = best_state
-                    for i, ggset in best_state.items():
-                        self.genes[i].assigned_sites = ggset
-
-                    # append the fidelity - best and current are now best, candidate is what triggered reset to best
-                    opt_trajectory.append((opt_trajectory[-1][0], opt_trajectory[-1][0], candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
-
-                else:
-                    self.genes[change_idx].assigned_sites = candidates
-                    current_state = {i:g.assigned_sites for i,g in enumerate(self.genes)}
-
-                    # if new fidelity is better than the best fidelity, update best fidelity
-                    if candidate_fidelity > opt_trajectory[-1][0]:
-                        best_state = current_state
-
-                        opt_trajectory.append((candidate_fidelity, candidate_fidelity, candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
+                while True:
+                    change_idx: int = random.choice(range(len(self.genes)))
+                    # pool sites from the genes
+                    if len(self.genes) > 1:
+                        unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) if i != change_idx])
                     else:
-                        # don't update best, so use old version
-                        opt_trajectory.append((opt_trajectory[-1][0], candidate_fidelity, candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
+                        unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) ])
+                    # these are a new set of GG sites from change_idx gene - they have to actually be assigned to the gene
+                    candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
 
-            # if change is rejected, do nothing except update trajectory with old fidelity
-            else:
-                opt_trajectory.append([opt_trajectory[-1][0], opt_trajectory[-1][1], candidate_fidelity, energy_diff, contender, thing_to_beat, temp])
+                    # if shuffle sites fails, pick different gene to optimize
+                    if candidates is not None:
+                        break
+
+
+                used_sites = np.hstack([
+                    unchanged_pool_sites,
+                    candidates.ggsite.to_numpy(),
+                    np.array([self.upstream_bbsite, self.downstream_bbsite]),
+                    np.array(self.other_used_sites)
+                ])
+
+                candidate_fidelity = predict_fidelity(used_sites.tolist(), self.ligation_data)
+                energy_diff = candidate_fidelity - opt_trajectory[-1][1]
+                thing_to_beat = random.random()
+                contender = np.exp(min([0, energy_diff / temp]))
+
+                if contender > thing_to_beat:
+
+                    # if we've gotten too far away from the best, then reset to the best
+                    if (opt_trajectory[-1][0] - candidate_fidelity) > 0.01:
+                        current_state = best_state
+                        for i, ggset in best_state.items():
+                            self.genes[i].assigned_sites = ggset
+
+                        # append the fidelity - best and current are now best, candidate is what triggered reset to best
+                        opt_trajectory.append((opt_trajectory[-1][0], opt_trajectory[-1][0], candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
+
+                    else:
+                        self.genes[change_idx].assigned_sites = candidates
+                        current_state = {i:g.assigned_sites for i,g in enumerate(self.genes)}
+
+                        # if new fidelity is better than the best fidelity, update best fidelity
+                        if candidate_fidelity > opt_trajectory[-1][0]:
+                            best_state = current_state
+
+                            opt_trajectory.append((candidate_fidelity, candidate_fidelity, candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
+                        else:
+                            # don't update best, so use old version
+                            opt_trajectory.append((opt_trajectory[-1][0], candidate_fidelity, candidate_fidelity, energy_diff, contender, thing_to_beat, temp))
+
+                # if change is rejected, do nothing except update trajectory with old fidelity
+                else:
+                    opt_trajectory.append([opt_trajectory[-1][0], opt_trajectory[-1][1], candidate_fidelity, energy_diff, contender, thing_to_beat, temp])
 
 
         self.optimized_sites = best_state
@@ -856,11 +887,23 @@ class Gene:
         left, right = np.array_split(np.arange(extra_space), [extra_space//2])
 
         if pad_oligo:
+            # trim flanks to just short of the enzyme site length so a stuffer can't be
+            # rejected for "containing" the genuine site that's already sitting right
+            # next to it (see clean_dna docstring), while still catching any *new*
+            # site the stuffer forms by combining with bases across that boundary
+            margin = len(self.enzyme.seq) - 1
+            rprimer_revc = str(Seq(self.rprimer.sequence).reverse_complement())
+            left_stuffer = clean_dna(left.size, self.enzyme.seq,
+                                      flank_left=self.fprimer.sequence[-margin:],
+                                      flank_right=oligo[:margin]).lower()
+            right_stuffer = clean_dna(right.size, self.enzyme.seq,
+                                       flank_left=oligo[-margin:],
+                                       flank_right=rprimer_revc[:margin]).lower()
             return "".join([self.fprimer.sequence,
-                            clean_dna(left.size, self.enzyme.seq).lower(),
+                            left_stuffer,
                             oligo,
-                            clean_dna(right.size, self.enzyme.seq).lower(),
-                            str(Seq(self.rprimer.sequence).reverse_complement())])
+                            right_stuffer,
+                            rprimer_revc])
 
         else:
             return "".join([self.fprimer.sequence,

@@ -175,3 +175,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# OMEGA run artifacts (regenerated per run, not source)
+individual_genes/
+output/

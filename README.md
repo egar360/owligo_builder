@@ -143,12 +143,24 @@ OMEGA is still being refined - some arguments were created during development th
 - `njunctions`: number of Golden Gate sites used to assemble each subpool. This number includes backbone vector sites, so for example if you specify njunctions=50, 48 GG sites are used to design fragments.
 - `nopt_steps`: number of optimization steps used to design GG sites. The default is 3000.
 - `nopt_runs`: the number of times OMEGA will design GG sites for each subpool. Each run uses a separate random seed and the run with the best fidelity is taken as the solution. Increasing run number is recommended for improving fidelity more than `nopt_steps`.
-- `add_primers`: whether primers should be added to oligopool sequences in `oligo_order.csv`. Default is True.
+- `add_primers`: whether primers should be added to oligopool sequences in `oligo_order.csv`. Default is True. **For `one_gene_per_pool`, always leave this `False`** - see [Known issues](#known-issues).
 - `pad_oligos`: whether random DNA should be added between the GG site and primer binding site. DNA does not include Type IIS restriction enzyme indicated by `enzyme`. Future updates will add support to exclude any DNA sequence to support downstream cloning applications that may use other kinds of restriction enzymes.
 - `njobs`: number of CPUs to run jobs in parallel when optimizing a single subpool. OMEGA uses `joblib` to parallelize runs defined by `nopt_runs` or `opt_seeds`. The default value is 1, but it's recommended to use more than that when optimizing pools. It significantly speeds up OMEGA.
 - `oligo_len`: max oligo length.
 - `opt_seeds`: Instead of indicating `nopt_runs`, instead provide a list of random seeds to use to initialize fragment design. This argument is partly an artifact from development, but can be useful for reproducibility. The number of seeds provided indicates the number of optimizations run for each pool. `opt_seeds` is mutually exclusive with `nopt_runs`. `nopt_runs` is sufficient in nearly all cases.
 
+
+## Known issues
+
+#### `add_primers: true` corrupts output for `one_gene_per_pool`
+
+`one_gene_per_pool` always adds primers to every oligo in `oligo_order.csv`/`optimization_results.csv` via a final, unconditional step (`_finalize_oligo_to_df`/`_add_primers_to_oligo` in `code/omega.py`), regardless of the `add_primers` config value. This final step was added later (commit `fac62a6`, "fix primer addition issue") to fix a separate bug where the original mechanism always assigned the *first* primer pair in `primers.csv` to every gene, instead of cycling through the sheet. That original mechanism (triggered by `add_primers: true` at the `package_library`/`package_oligos` call sites) was never removed.
+
+As a result, setting `add_primers: true` for `one_gene_per_pool` causes primers to be added **twice**: once by the old per-gene mechanism, and again by the final step. This produces oligos longer than `oligo_len` with the forward/reverse primer sequences literally duplicated back-to-back.
+
+**Workaround (current default in our configs): always set `add_primers: false` for `one_gene_per_pool`.** The final step adds primers unconditionally anyway, so nothing is lost - final oligos still have primers attached in `oligo_order.csv`.
+
+Proper fix (not yet applied - needs a full re-test of `one_gene_per_pool` before landing): remove the old per-gene primer-adding mechanism from `one_gene_per_pool` entirely (force `add_primers=False` internally at the `package_library`/`package_oligos` call sites, independent of the config value) so there's only one, correct place primers get added.
 
 ## References
 
