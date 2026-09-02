@@ -1,7 +1,7 @@
-input_seqs: data/fastas/v1_1k_omega_library.fasta
+input_seqs: data/fastas/owligo_test.fasta
 primers: data/owligo_primers.csv
 
-output_dir: output/26-j052-Yu
+output_dir: output/owligo_default
 enzyme: Esp3I
 upstream_bbsite: GATA
 downstream_bbsite: ATCG
