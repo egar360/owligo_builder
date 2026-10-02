@@ -531,10 +531,15 @@ def one_gene_per_pool(
             optimization=optimization
         )
         # save optimized gene fragment and empty oligo
-        optimized_library = library.package_library(add_primers=add_primers, pad_oligo=pad_oligos)
+        # Primers and padding are added once for this subcommand, at the end, by
+        # _finalize_oligo_to_df - which also assigns each gene its own primer pair.
+        # The per-gene mechanism reached through these two calls predates that step and
+        # would add a second copy of the pair to every oligo, so it is always disabled
+        # here regardless of `add_primers`/`pad_oligos`.
+        optimized_library = library.package_library(add_primers=False, pad_oligo=False)
         optimize_lib_list.append(optimized_library)
 
-        oligopool = library.package_oligos(add_primers=add_primers, pad_oligo=pad_oligos)
+        oligopool = library.package_oligos(add_primers=False, pad_oligo=False)
         oligo_list.append(oligopool)
 
         pool_stats = pd.DataFrame.from_dict(
