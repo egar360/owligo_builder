@@ -3,6 +3,9 @@
 import re
 import os
 import shutil
+import stat
+from collections import defaultdict
+from math import ceil
 from os.path import join, exists
 from typing import Optional, Union
 import random
@@ -10,6 +13,7 @@ import random
 from jsonargparse import CLI
 import pandas as pd
 import numpy as np
+import yaml
 
 # Cartographer imports
 from data_classes import Enzyme, EnzymeTypes, LigationDataOpt, define_ligation_data, PrimerIterator, define_enzyme
@@ -17,7 +21,7 @@ from library_classes import Library
 from junctions import optimize_junctions
 from Bio import SeqIO
 from Bio.Seq import Seq
-from helpers import clean_dna, unique_orthogonal
+from helpers import clean_dna, unique_orthogonal, dna_contains_seq
 
 def genes(
         input_seqs: str,
@@ -38,6 +42,11 @@ def genes(
         add_primers: bool = True,
         pad_oligos: bool = True,
 
+        # auto-tranching arguments
+        tranche: bool = False,
+        tranche_setup_only: bool = False,
+        job_id: Optional[str] = None,
+
         # optimization arguments
         nopt_steps: int = 1000,
         nopt_runs: Optional[int] = 5,
@@ -54,6 +63,18 @@ def genes(
     Design library for pooled golden gate assembly.
 
     Args:
+        tranche: Split `input_seqs` into length-matched tranches and design each one
+            separately. Every gene in a library is broken into the same number of
+            fragments, set by the longest gene, so a library mixing short and long
+            genes cannot be designed in one run. Each tranche gets its own fasta,
+            a disjoint slice of `primers`, a config under
+            `configs/tranches/<job_id>/`, a runner script, and output under
+            `<output_dir>/nf<n>/`.
+        tranche_setup_only: With `tranche`, write the tranche fastas, primer slices,
+            configs and runner script but do not run the optimizations. Useful for
+            submitting the tranches as separate jobs.
+        job_id: Name for the generated tranche files. Defaults to the basename of
+            `output_dir`.
         input_seqs: File path to library sequences in fasta format.
         upstream_bbsite: GG site in str format if applicable.
         downstream_bbsite: GG site in str format if applicable.
@@ -78,6 +99,27 @@ def genes(
     """
     #pylint: disable=too-many-arguments, too-many-locals
 
+    # Auto-tranching dispatch. Must happen before any argument below is reassigned,
+    # because each tranche is designed by calling this function again with the same
+    # (still unconverted) values.
+    if tranche:
+        _run_tranches(
+            params=dict(
+                input_seqs=input_seqs, njunctions=njunctions,
+                upstream_bbsite=upstream_bbsite, downstream_bbsite=downstream_bbsite,
+                primers=primers, output_dir=output_dir,
+                other_used_sites=other_used_sites, enzyme=enzyme,
+                other_enzymes=other_enzymes, ligation_data=ligation_data,
+                add_primers=add_primers, pad_oligos=pad_oligos,
+                nopt_steps=nopt_steps, nopt_runs=nopt_runs, opt_seeds=opt_seeds,
+                njobs=njobs, oligo_len=oligo_len, min_size=min_size,
+                optimization=optimization, dev=dev,
+            ),
+            job_id=job_id or os.path.basename(os.path.normpath(output_dir)),
+            setup_only=tranche_setup_only,
+        )
+        return
+
     # if output directory doesn't exist, write it
     if not exists(output_dir):
         os.makedirs(output_dir)
@@ -93,7 +135,7 @@ def genes(
     ligation_data = define_ligation_data(ligation_data, assembly_enzyme)
 
     # print input parameters
-    print(f"Read {len(input_seqs_recs)} from {input_seqs}.\nSequence lengths are {min(map(lambda x: len(x[1]), input_seqs_recs))} - {min(map(lambda x: len(x[1]), input_seqs_recs))} bp")
+    print(f"Read {len(input_seqs_recs)} from {input_seqs}.\nSequence lengths are {min(map(lambda x: len(x[1]), input_seqs_recs))} - {max(map(lambda x: len(x[1]), input_seqs_recs))} bp")
     print(f"Using {enzyme.name} and {ligation_data.name} data to assemble library.")
     print(f"Maximum number of GG sites allowed per pool: {njunctions}")
     print(f"Upstream backbone site: {upstream_bbsite}")
@@ -171,6 +213,177 @@ def genes(
             # print(pool[0].opt_trajectory)
             np.save(join(trajectory_dir, f'pool_{pool[0].name}_seed-{pool[2]}.npy'), np.array(pool[0].opt_trajectory))
 
+def _enum_value(value):
+    """jsonargparse hands `enzyme`/`ligation_data` in as Enums, but a direct python
+    caller may pass plain strings. Normalize to the str form a config file expects.
+    """
+
+    return value.value if hasattr(value, 'value') else value
+
+
+def _required_nfrags(name: str, seq: str, params: dict, primer_iter: PrimerIterator,
+                     assembly_enzyme) -> int:
+    """Number of fragments this gene needs on its own.
+
+    Goes through Library.estimate_nfrags rather than reimplementing the arithmetic, so
+    the tranche boundaries cannot drift from what an actual run will decide.
+    """
+
+    return Library(
+        genes=[(name, seq)],
+        primers=primer_iter,
+        oligo_len=params['oligo_len'],
+        enzyme=assembly_enzyme,
+        upstream_bbsite=params['upstream_bbsite'],
+        downstream_bbsite=params['downstream_bbsite'],
+        other_used_sites=params['other_used_sites'],
+        min_size=params['min_size'],
+    ).estimate_nfrags()
+
+
+def _run_tranches(params: dict, job_id: str, setup_only: bool) -> None:
+    """Split a library into length-matched tranches and design each one.
+
+    Every gene in a library is broken into the same number of fragments, set by the
+    longest gene (see Library.estimate_nfrags), so a library spanning a wide length
+    range cannot be designed in one run - the short genes cannot host the junction
+    count the long ones demand. Grouping genes by the fragment count each needs on its
+    own makes every tranche internally consistent.
+
+    Each tranche gets its own fasta, a *disjoint* slice of the primer sheet, a config,
+    and an output subdirectory, plus one runner script for the whole job.
+    """
+    #pylint: disable=too-many-locals
+
+    assembly_enzyme = define_enzyme(params['enzyme'])
+    primer_iter = PrimerIterator(params['primers'], assembly_enzyme)
+    primer_df = pd.read_csv(params['primers'])
+
+    recs = list(SeqIO.parse(params['input_seqs'], 'fasta'))
+    if not recs:
+        raise ValueError(f"No sequences read from {params['input_seqs']}.")
+
+    groups = defaultdict(list)
+    for rec in recs:
+        nfrags = _required_nfrags(rec.id, str(rec.seq), params, primer_iter, assembly_enzyme)
+        groups[nfrags].append(rec)
+
+    cfg_dir = join('configs', 'tranches', job_id)
+    fasta_dir = join('data', 'fastas', 'tranches', job_id)
+    primer_dir = join('data', 'primers', 'tranches', job_id)
+    for directory in (cfg_dir, fasta_dir, primer_dir):
+        os.makedirs(directory, exist_ok=True)
+
+    nbackbone = 2 + len(params['other_used_sites'] or [])
+    tranches = []
+    offset = 0
+    for nfrags in sorted(groups):
+        recs_nf = groups[nfrags]
+        lengths = [len(r.seq) for r in recs_nf]
+
+        # mirror Library.optimize_pools so the primer slice is sized correctly
+        ngenes_per_pool = (params['njunctions'] - nbackbone) // max(nfrags - 1, 1)
+        if ngenes_per_pool < 1:
+            raise ValueError(
+                f"njunctions={params['njunctions']} is too small for genes needing "
+                f"{nfrags} fragments ({min(lengths)}-{max(lengths)} bp): that leaves room "
+                f"for less than one gene per pool. Raise njunctions."
+            )
+        npools = ceil(len(recs_nf) / ngenes_per_pool)
+
+        if offset + npools > len(primer_df):
+            raise ValueError(
+                f"Ran out of primer pairs: tranche nf{nfrags} needs {npools} more, but "
+                f"{params['primers']} holds {len(primer_df)} and {offset} are already "
+                "allocated to earlier tranches."
+            )
+
+        tranche = {
+            'nfrags': nfrags, 'ngenes': len(recs_nf),
+            'lo': min(lengths), 'hi': max(lengths),
+            'ngenes_per_pool': ngenes_per_pool, 'npools': npools, 'offset': offset,
+            'fasta': join(fasta_dir, f'nf{nfrags}.fasta'),
+            'primers': join(primer_dir, f'nf{nfrags}.csv'),
+            'config': join(cfg_dir, f'nf{nfrags}.yml'),
+            'output_dir': join(params['output_dir'], f'nf{nfrags}'),
+        }
+
+        SeqIO.write(recs_nf, tranche['fasta'], 'fasta')
+        # Disjoint slice. Each run restarts at primer row 0, so without this the first
+        # pool of every tranche would be assigned the same (fwd, rev) pair and the
+        # subpools could not be amplified apart.
+        primer_df.iloc[offset:offset + npools].to_csv(tranche['primers'], index=False)
+
+        cfg = dict(params)
+        cfg.update(
+            input_seqs=tranche['fasta'],
+            primers=tranche['primers'],
+            output_dir=tranche['output_dir'],
+            enzyme=_enum_value(params['enzyme']),
+            ligation_data=_enum_value(params['ligation_data']),
+            other_enzymes=([_enum_value(e) for e in params['other_enzymes']]
+                           if params['other_enzymes'] else None),
+        )
+        with open(tranche['config'], 'w') as f:
+            f.write(f"# tranche nf{nfrags} of job '{job_id}': {len(recs_nf)} genes, "
+                    f"{min(lengths)}-{max(lengths)} bp, {npools} pool(s)\n")
+            f.write(f"# primer rows {offset}-{offset + npools - 1} of {params['primers']}\n")
+            f.write("# generated by `omega.py genes --tranche` - regenerate rather than edit\n")
+            yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
+
+        tranches.append(tranche)
+        offset += npools
+
+    script = join(cfg_dir, 'run_tranches.sh')
+    with open(script, 'w') as f:
+        f.write(f"""#!/usr/bin/env bash
+# Design every tranche of job '{job_id}'. Generated by `omega.py genes --tranche`.
+# Usage: {script} [njobs]
+set -euo pipefail
+cd "$(cd "$(dirname "${{BASH_SOURCE[0]}}")/../../.." && pwd)"
+NJOBS="${{1:-{params['njobs']}}}"
+for CFG in {cfg_dir}/nf*.yml; do
+  echo "=== $CFG (njobs=$NJOBS) ==="
+  python ./code/omega.py genes --config "$CFG" --njobs "$NJOBS"
+done
+echo "All {len(tranches)} tranches finished."
+""")
+    os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    print(f"\nTranched {params['input_seqs']} ({len(recs)} genes) into {len(tranches)} "
+          f"length-matched tranche(s) for job '{job_id}':\n")
+    header = (f"{'nf':>3} {'genes':>6} {'length':>12} {'g/pool':>7} {'pools':>6} "
+              f"{'primer rows':>12}  config")
+    print(header)
+    print('-' * len(header))
+    for t in tranches:
+        span = "{}-{}".format(t['lo'], t['hi'])
+        rows = "{}-{}".format(t['offset'], t['offset'] + t['npools'] - 1)
+        print(f"{t['nfrags']:>3} {t['ngenes']:>6} {span:>12} "
+              f"{t['ngenes_per_pool']:>7} {t['npools']:>6} {rows:>12}  {t['config']}")
+    print(f"\n{offset} pools total, "
+          f"{sum(t['nfrags'] * t['ngenes'] for t in tranches)} oligos expected.")
+    print(f"Configs: {cfg_dir}")
+    print(f"Runner:  {script}")
+
+    if setup_only:
+        print("\n`tranche_setup_only` is set, so nothing was designed. Run the tranches with:")
+        print(f"  {script} {params['njobs']}")
+        return
+
+    for i, t in enumerate(tranches, 1):
+        print(f"\n{'=' * 70}\nTranche {i}/{len(tranches)}: nf{t['nfrags']} "
+              f"({t['ngenes']} genes, {t['lo']}-{t['hi']} bp, {t['npools']} pool(s)) "
+              f"-> {t['output_dir']}\n{'=' * 70}")
+        tranche_params = dict(params)
+        tranche_params.update(
+            input_seqs=t['fasta'], primers=t['primers'], output_dir=t['output_dir']
+        )
+        genes(**tranche_params, tranche=False)
+
+    print(f"\nAll {len(tranches)} tranches designed under {params['output_dir']}/")
+
+
 # generate one gene per pool for plasmid cloning.
 def one_gene_per_pool(
         input_seqs: str,
@@ -190,6 +403,11 @@ def one_gene_per_pool(
         # oligo packaging arguments
         add_primers: bool = True,
         pad_oligos: bool = True,
+
+        # optional universal amplification primers (e.g. oPool universal primers),
+        # wrapped around every finished oligo in addition to (on top of) oligo_len
+        universal_fwd_primer: Optional[str] = None,
+        universal_rev_primer: Optional[str] = None,
 
         # optimization arguments
         nopt_steps: int = 1000,
@@ -238,6 +456,18 @@ def one_gene_per_pool(
     assembly_enzyme = define_enzyme(enzyme)
     #! Right now this only recognizes other TypeIIS enzymes
     other_enzymes = [define_enzyme(e) for e in other_enzymes] if other_enzymes is not None else []
+
+    # fail fast: a universal primer that already contains the assembly enzyme's site
+    # cannot be fixed by mutating it (unlike the random stuffer DNA), so catch it before
+    # running the (potentially long) optimization instead of discovering it at the end
+    for label, universal_primer in [('universal_fwd_primer', universal_fwd_primer),
+                                     ('universal_rev_primer', universal_rev_primer)]:
+        if universal_primer is not None and dna_contains_seq(universal_primer, assembly_enzyme.seq):
+            raise ValueError(
+                f"{label} ('{universal_primer}') contains the {assembly_enzyme.name} "
+                f"recognition site ({assembly_enzyme.seq}) or its reverse complement - "
+                "choose a different sequence."
+            )
 
     # format input sequences into Gene objects
     input_seqs_recs = [(rec.id, str(rec.seq)) for rec in SeqIO.parse(input_seqs, 'fasta')]
@@ -301,10 +531,15 @@ def one_gene_per_pool(
             optimization=optimization
         )
         # save optimized gene fragment and empty oligo
-        optimized_library = library.package_library(add_primers=add_primers, pad_oligo=pad_oligos)
+        # Primers and padding are added once for this subcommand, at the end, by
+        # _finalize_oligo_to_df - which also assigns each gene its own primer pair.
+        # The per-gene mechanism reached through these two calls predates that step and
+        # would add a second copy of the pair to every oligo, so it is always disabled
+        # here regardless of `add_primers`/`pad_oligos`.
+        optimized_library = library.package_library(add_primers=False, pad_oligo=False)
         optimize_lib_list.append(optimized_library)
 
-        oligopool = library.package_oligos(add_primers=add_primers, pad_oligo=pad_oligos)
+        oligopool = library.package_oligos(add_primers=False, pad_oligo=False)
         oligo_list.append(oligopool)
 
         pool_stats = pd.DataFrame.from_dict(
@@ -354,7 +589,8 @@ def one_gene_per_pool(
 
     oligo_columns = [col for col in final_lib_df.columns if re.match(r'oligo_\d+', col)]
 
-    opt_df , final_oligo_df = _finalize_oligo_to_df(final_lib_df, concat_oligo_df, oligo_len, assembly_enzyme)
+    opt_df , final_oligo_df = _finalize_oligo_to_df(final_lib_df, concat_oligo_df, oligo_len, assembly_enzyme,
+        universal_fwd_primer, universal_rev_primer)
 
     opt_df.to_csv(os.path.join(output_dir, 'optimization_results.csv'))
     print(f"Finished optimization. Saved to {os.path.join(output_dir, 'optimization_results.csv')}")
@@ -392,7 +628,8 @@ def split_fasta_by_gene(input_fasta_file, output_directory="individual_genes"):
         print(f"An error occurred: {e}")
 
 # add primer sequence in the final synOligo sequence
-def _finalize_oligo_to_df(opt_df, oligo_df, oligo_len, enzyme):
+def _finalize_oligo_to_df(opt_df, oligo_df, oligo_len, enzyme,
+    universal_fwd_primer: Optional[str] = None, universal_rev_primer: Optional[str] = None):
     """
     Add amplification tag (for forward & reverse primer) and padding oligo sequence
     at both 5' and 3' of the gene fragment carried restriction enzyme sites in dataframe opt_df and oligo_df, and return 2 new df
@@ -405,6 +642,9 @@ def _finalize_oligo_to_df(opt_df, oligo_df, oligo_len, enzyme):
         oligo_df (df): dataframe for 'oligo_order.csv' in which the oligo sequences did not contain primer binding regions and padding sequence
         oligo_len (int): input of synoligo length
         enzyme (class object): enzyme.name ; enzyme.seq ; enzyme.revc_seq (rev complement seq of enzyme seq)
+        universal_fwd_primer/universal_rev_primer: optional fixed amplification primers
+            (e.g. oPool universal primers) wrapped around every oligo on top of oligo_len,
+            outside the fwd_primer/rev_primer pair already added above.
     """
     df1 = opt_df.copy()
     df2 = oligo_df.copy()
@@ -423,15 +663,46 @@ def _finalize_oligo_to_df(opt_df, oligo_df, oligo_len, enzyme):
                 # doublecheck if there are extra restriction enzyme sites in the sequence
                 forward_count = oligo_final.count(enzyme_forward)
                 reverse_count = oligo_final.count(enzyme_reverse_complement)
-                df1.at[idx, oligo_col] = oligo_final
-                oligo_list.append(oligo_final)
                 if forward_count + reverse_count > 2:
                     print('Extra restriction enzyme sites are found in row: ', idx, ', column', oligo_col)
+
+                if universal_fwd_primer is not None or universal_rev_primer is not None:
+                    wrapped = _add_universal_primers(oligo_final, universal_fwd_primer, universal_rev_primer)
+                    # the universal primers are fixed sequences, not randomly generated
+                    # like the stuffer DNA, so a site formed at this new boundary can't
+                    # be mutated away - flag it against the specific gene/primer pairing
+                    # that caused it so it can be addressed (different enzyme, different
+                    # universal primer, or exclude that subpool primer) rather than
+                    # silently shipping a design that will over-digest during assembly
+                    new_forward_count = wrapped.count(enzyme_forward)
+                    new_reverse_count = wrapped.count(enzyme_reverse_complement)
+                    if new_forward_count + new_reverse_count > forward_count + reverse_count:
+                        print('Universal primers introduced an extra restriction enzyme site in row: ',
+                              idx, ', column', oligo_col)
+                    oligo_final = wrapped
+
+                df1.at[idx, oligo_col] = oligo_final
+                oligo_list.append(oligo_final)
             else:
                 pass
     df2['sequence'] = oligo_list
 
     return df1,df2
+
+
+def _add_universal_primers(oligo_final: str, universal_fwd_primer: Optional[str],
+    universal_rev_primer: Optional[str]) -> str:
+    """Wrap a finished oligo with fixed universal amplification primers, added on top
+    of oligo_len rather than carved out of it. Reverse primer is added as its reverse
+    complement, matching the fwd_primer/rev_primer convention used elsewhere.
+    """
+    wrapped = oligo_final
+    if universal_fwd_primer is not None:
+        wrapped = universal_fwd_primer + wrapped
+    if universal_rev_primer is not None:
+        wrapped = wrapped + str(Seq(universal_rev_primer).reverse_complement())
+
+    return wrapped
 
 
 # add primers now in the final concatenated df

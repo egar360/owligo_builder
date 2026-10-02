@@ -21,6 +21,12 @@ from joblib import Parallel, delayed
 #pylint:disable=too-many-instance-attributes
 #pylint:disable=too-many-arguments
 
+# Minimum distance (bp) required between neighbouring GG junctions when reshuffling a
+# gene's breakpoints. Was previously hardcoded at each shuffle_site call site.
+#! Not yet wired to the `min_size` config value - the two must be changed together,
+#! because Library.optimize_pools validates against this constant.
+MIN_JUNCTION_DIST = 40
+
 
 def get_coding_space(oligo_len: int, fprimer: str, rprimer: str, enzyme: Enzyme) -> int:
     """Estimate coding space in oligo that can be used for encoding constructs."""
@@ -148,6 +154,28 @@ class Library:
         # if not enough primers for estimated pools, raise error
         if len(self.primers) < (len(self.genes)/ngenes_per_pool):
             raise ValueError('Not enough primers for estimated number of pools.')
+
+        # Every gene is broken into the same number of fragments, set by the LONGEST gene
+        # (see estimate_nfrags), so a short gene in a library with a long one can be asked
+        # for more junctions than its length can physically hold. Gene.shuffle_site then
+        # never returns a candidate for it, and a pool whose genes are all too short has
+        # nothing left to optimize. Catch that here - the alternative is discovering it
+        # part-way through a long run.
+        min_gene_len = self.nfrags * MIN_JUNCTION_DIST
+        too_short = [(name, len(seq)) for name, seq in self.genes if len(seq) < min_gene_len]
+        if too_short:
+            lengths = [l for _, l in too_short]
+            raise ValueError(
+                f"{len(too_short)} of {len(self.genes)} genes are too short to be cut into "
+                f"{self.nfrags} fragments with junctions at least {MIN_JUNCTION_DIST} bp apart "
+                f"(need >= {min_gene_len} bp, these are {min(lengths)}-{max(lengths)} bp).\n"
+                f"Fragment count is set by the longest gene in the library "
+                f"({max(len(s) for _, s in self.genes)} bp), so mixing very short and very "
+                f"long genes in one run cannot work.\n"
+                f"Split the input fasta into length-matched sets and run each separately, or "
+                f"use the `one_gene_per_pool` subcommand, which sizes fragments per gene.\n"
+                f"First offenders: {too_short[:10]}"
+            )
 
         # run optimization for each pool
         it = zip(
@@ -367,7 +395,7 @@ class Pool:
 
                 change_idx: int = random.choice(range(len(self.genes)))
                 unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) if i != change_idx])
-                candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
+                candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=MIN_JUNCTION_DIST)
 
                 used_sites = np.hstack([
                     unchanged_pool_sites,
@@ -416,7 +444,7 @@ class Pool:
         pool_sites = np.hstack(
             [g.assigned_sites.pos.to_numpy() for i, g in enumerate(self.genes) if i != gene_idx]
         )
-        new_candidates = self.genes[gene_idx].shuffle_site(pool_ggsites=pool_sites, min_dist=40)
+        new_candidates = self.genes[gene_idx].shuffle_site(pool_ggsites=pool_sites, min_dist=MIN_JUNCTION_DIST)
 
         return new_candidates
 
@@ -571,6 +599,10 @@ class SAPool:
             # change log range
             for temp in tqdm(np.linspace(start_temp, end_temp, nopt_steps), ncols=100, total=nopt_steps, disable=disable_progress, leave=True):
 
+                # track which genes have already refused to yield a candidate this step -
+                # if every gene in the pool refuses, there is nothing left to shuffle and
+                # looping again would spin forever, so fail with a usable message instead
+                refused: set[int] = set()
                 while True:
                     change_idx: int = random.choice(range(len(self.genes)))
                     # pool sites from the genes
@@ -579,11 +611,27 @@ class SAPool:
                     else:
                         unchanged_pool_sites: np.ndarray[str] = np.hstack([g.assigned_sites.ggsite.to_numpy() for i, g in enumerate(self.genes) ])
                     # these are a new set of GG sites from change_idx gene - they have to actually be assigned to the gene
-                    candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=40)
+                    candidates: pd.DataFrame = self.genes[change_idx].shuffle_site(pool_ggsites=unchanged_pool_sites, min_dist=MIN_JUNCTION_DIST)
 
                     # if shuffle sites fails, pick different gene to optimize
                     if candidates is not None:
                         break
+
+                    refused.add(change_idx)
+                    if len(refused) == len(self.genes):
+                        raise ValueError(
+                            f"Pool {self.name}: no gene can be re-fragmented into "
+                            f"{self.nfrags} fragments with junctions at least "
+                            f"{MIN_JUNCTION_DIST} bp apart, so this pool cannot be optimized.\n"
+                            f"Genes (name, length): "
+                            f"{[(g.name, len(g.seq)) for g in self.genes]}\n"
+                            f"Every gene in a library is fragmented into the same number of "
+                            f"fragments, set by the longest gene (see Library.estimate_nfrags), "
+                            f"and a gene needs at least nfrags * {MIN_JUNCTION_DIST} = "
+                            f"{self.nfrags * MIN_JUNCTION_DIST} bp to support that. Split the "
+                            f"input into length-matched sets so the longest and shortest genes "
+                            f"in one run need the same fragment count."
+                        )
 
 
                 used_sites = np.hstack([
@@ -659,7 +707,7 @@ class SAPool:
         pool_sites = np.hstack(
             [g.assigned_sites.pos.to_numpy() for i, g in enumerate(self.genes) if i != gene_idx]
         )
-        new_candidates = self.genes[gene_idx].shuffle_site(pool_ggsites=pool_sites, min_dist=40)
+        new_candidates = self.genes[gene_idx].shuffle_site(pool_ggsites=pool_sites, min_dist=MIN_JUNCTION_DIST)
 
         return new_candidates
 
@@ -806,7 +854,14 @@ class Gene:
                 candidates = candidates[~candidates.ggsite.isin(used_sites)]
                 candidate = candidates.sample(n=1, random_state=42)
                 return pd.concat([keep_sites, candidate])
-            except:
+            except IndexError:
+                # permissible_pos came back empty - the longest section of this gene is
+                # too short to take a junction with min_dist spacing on both sides.
+                # Retry with a different change_loc.
+                continue
+            except ValueError:
+                # candidates is empty after dropping used sites (and their WC pairs), so
+                # sample(n=1) has nothing to draw. Also a legitimate retry.
                 continue
 
 
