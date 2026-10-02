@@ -12,10 +12,13 @@ njunctions: 50
 nopt_steps: 1000
 nopt_runs: 5
 njobs: 1
-oligo_len: 230
+oligo_len: 306
 
 add_primers: false
 pad_oligos: false
+
+universal_fwd_primer: CGATCCGCCCTCACTACAACCA
+universal_rev_primer: TCCCTCATCGACGCCAGAGTCA
 
 dev: false  # remove
 min_size: 40  # remove
